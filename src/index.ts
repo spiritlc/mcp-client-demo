@@ -11,6 +11,13 @@ dotenv.config(); // 加载 .env 文件中的环境变量
 class MCPClient {
     private openai: OpenAI;
     private client: Client;
+    private messages: ChatCompletionMessageParam[] = [
+        {
+            role: "system",
+            content: "You are a helpful assistant that can answer questions and help with tasks."
+        },
+    ];
+    private availableTools: any[] = [];
 
     constructor() {
         this.openai = new OpenAI({
@@ -42,22 +49,9 @@ class MCPClient {
 
         await this.client.connect(transport);
 
-        // 列出可用的工具
+        // 获取并转换可用工具列表
         const tools = (await this.client.listTools()).tools as unknown as Tool[];
-        console.log("\nConnected to server with tools:", tools.map(tool => tool.name));
-    }
-
-    async processQuery(query: string): Promise<string> {
-        const messages: ChatCompletionMessageParam[] = [
-            {
-                role: "user",
-                content: query,
-            },
-        ];
-
-        // 获取可用工具列表
-        const tools = (await this.client.listTools()).tools as unknown as Tool[];
-        const availableTools = tools.map(tool => ({
+        this.availableTools = tools.map(tool => ({
             type: "function" as const,
             function: {
                 name: tool.name as string,
@@ -70,42 +64,36 @@ class MCPClient {
             }
         }));
 
-        // 初始 OpenAI API 调用
-        const response = await this.openai.chat.completions.create({
-            model: process.env.OPENAI_MODEL as string,
-            messages: [
-                {
-                    role: "system",
-                    content: "You are a helpful assistant with access to tools. You must follow the schema of the tools.",
-                },
-                ...messages
-            ],
-            tools: availableTools,
-        });
+        console.log("\nConnected to server with tools:", tools.map(tool => tool.name));
+    }
 
-        const finalText: string[] = [];
-        const toolResults = [];
+    private async handleToolCalls(response: OpenAI.Chat.Completions.ChatCompletion, messages: ChatCompletionMessageParam[]) {
+        let currentResponse = response;
+        let counter = 0; // 避免重复打印 AI 的响应消息
 
-        // 处理工具调用
-        if (response.choices[0].message.tool_calls) {
-            for (const toolCall of response.choices[0].message.tool_calls) {
+        // 处理工具调用, 直到没有工具调用
+        while (currentResponse.choices[0].message.tool_calls) {
+            // 打印当前 AI 的响应消息
+            if (currentResponse.choices[0].message.content && counter !== 0) {
+                console.log("\n🤖 AI:", currentResponse.choices[0].message.content);
+            }
+            counter++;
+
+            for (const toolCall of currentResponse.choices[0].message.tool_calls) {
                 const toolName = toolCall.function.name;
                 const toolArgs = JSON.parse(toolCall.function.arguments);
 
-                console.log(`🔧Calling tool ${toolName} with args ${JSON.stringify(toolArgs)} `);
+                console.log(`\n🔧 调用工具 ${toolName}`);
+                console.log(`📝 参数:`, JSON.stringify(toolArgs, null, 2));
 
                 // 执行工具调用
                 const result = await this.client.callTool({
                     name: toolName,
                     arguments: toolArgs
                 });
-                toolResults.push({ call: toolName, result });
 
-                console.log(`🔧Tool ${toolName} called successfully`);
-
-                // 继续与工具结果的对话
-                messages.push(response.choices[0].message);
-
+                // 添加 AI 的响应和工具调用结果到消息历史
+                messages.push(currentResponse.choices[0].message);
                 messages.push({
                     role: "tool",
                     tool_call_id: toolCall.id,
@@ -113,25 +101,45 @@ class MCPClient {
                 } as ChatCompletionMessageParam);
             }
 
-            // 获取下一个来自 OpenAI 的响应
-            const nextResponse = await this.openai.chat.completions.create({
+            // 获取下一个响应
+            currentResponse = await this.openai.chat.completions.create({
                 model: process.env.OPENAI_MODEL as string,
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are a helpful assistant with access to tools.",
-                    },
-                    ...messages
-                ],
-                tools: availableTools,
+                messages: messages,
+                tools: this.availableTools,
             });
-
-            finalText.push(nextResponse.choices[0].message.content || "");
-        } else {
-            finalText.push(response.choices[0].message.content || "");
         }
 
-        return finalText.join("\n");
+        return currentResponse;
+    }
+
+    async processQuery(query: string): Promise<string> {
+        // 添加用户查询到消息历史
+        this.messages.push({
+            role: "user",
+            content: query,
+        });
+
+        // 初始 OpenAI API 调用
+        let response = await this.openai.chat.completions.create({
+            model: process.env.OPENAI_MODEL as string,
+            messages: this.messages,
+            tools: this.availableTools,
+        });
+
+        // 打印初始响应消息
+        if (response.choices[0].message.content) {
+            console.log("\n🤖 AI:", response.choices[0].message.content);
+        }
+
+        // 如果有工具调用，处理它们
+        if (response.choices[0].message.tool_calls) {
+            response = await this.handleToolCalls(response, this.messages);
+        }
+
+        // 将最终响应添加到消息历史
+        this.messages.push(response.choices[0].message);
+
+        return response.choices[0].message.content || "";
     }
 
     async chatLoop() {
