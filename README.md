@@ -9,3 +9,8 @@ OPENAI_MODEL = ''
 
 ### 执行命令 npm run test mcp-server-url
 
+
+### 通义千问 免费送token
+[模型列表](https://help.aliyun.com/zh/model-studio/getting-started/models)
+
+
